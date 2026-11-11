@@ -2,7 +2,7 @@
 
 > ⚠️ **Risks.** This is an experimental build. Installing it **erases USERDATA** (all Android data). It needs an unlocked bootloader (Knox trips). Only two partitions are written: **BOOT (`sda7`)** and **USERDATA (`sda24`)**. EFS, recovery and the bootloaders are not touched, but **make a full backup** before you start.
 >
-> **SM-G950F** only (Exynos 8895, `dreamlte`). The Snapdragon models (G950U/W/0) and the S8+ (G955F) are not supported: the S8+ has a different panel and partition numbers may differ.
+> **SM-G950F** only (Exynos 8895, `dreamlte`). An untested draft for the Exynos S8+ (SM-G955F/FD) is in `s8plus-install.md`: its USERDATA is `sda27`, not `sda24`. The Snapdragon models (G950U/W/0) and the S8+ (G955F) are not supported: the S8+ has a different panel and partition numbers may differ.
 
 ## 0. Requirements
 

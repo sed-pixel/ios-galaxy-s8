@@ -7,6 +7,8 @@ cd "$(dirname "$0")"
 CC=aarch64-linux-gnu-gcc
 OBJCOPY=aarch64-linux-gnu-objcopy
 CFLAGS="-O2 -ffreestanding -nostdlib -fno-pic -mgeneral-regs-only -mstrict-align -fno-stack-protector -fno-tree-loop-distribute-patterns -march=armv8-a -Wall -Wextra -Werror"
+# DEVICE=dream2lte: Galaxy S8+ touch probe (STM FTS at 0x49). Untested on hardware.
+[ "${DEVICE:-dreamlte}" = dream2lte ] && CFLAGS="$CFLAGS -DDREAM2LTE"
 mkdir -p out
 $CC $CFLAGS -c start.S -o out/start.o
 $CC $CFLAGS -c loader.c -o out/loader.o

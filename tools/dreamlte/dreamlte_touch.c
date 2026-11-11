@@ -23,7 +23,29 @@
 #define S8_I2C_CLKIN            26000000u
 #define S8_I2C_SCL_HZ           400000u
 
+/*
+ * Galaxy S8+ (SM-G955F/FD, dream2lte): UNTESTED draft. Same bus, rails and
+ * interrupt as the S8 (hsi2c_23 0x108e0000, LDO34/35, gpa1-0; read from the
+ * phone's live DT and /sys), but the chip is an STMicroelectronics
+ * FTS8CD56 ("stm,fts_touch", firmware tsp_stm/fts8cd56_dream2.fw) at I2C
+ * address 0x49, panel range 1440x2960 (stm,max_coords 0x59f,0xb8f).
+ * Boot args: s8fts=1 selects it; s8fts_fmt=0|1 picks the event layout
+ * (0 = mainline stmfts.c, 1 = Samsung fts_ts style). Command and event IDs
+ * come from mainline stmfts.c; whether the FTS8 variant matches them is NOT
+ * verified, which is why the first events are logged raw ("S8 TOUCH: raw").
+ */
+#define S8TS_FTS_ADDR           0x49u
+#define S8FTS_XMAX              1440u
+#define S8FTS_YMAX              2960u
+#define S8FTS_EV_SIZE           8u
+#define S8FTS_EV_PER_READ       8u
+#define S8FTS_RAW_LOG           48u
+
 static vm_offset_t s8ts_i2c, s8ts_alive, s8bat_i2c;
+static unsigned s8ts_addr = S8TS_ADDR;
+static int s8ts_fts;            /* s8fts=1: STM FTS8CD56 (S8+) instead of S6SY761 */
+static int s8ts_fmt;            /* s8fts_fmt: FTS event layout guess */
+static unsigned s8ts_raw_left = S8FTS_RAW_LOG;
 static int s8ts_sleep;
 static int s8ts_native;         /* sweetfb_native: iOS sees the whole panel */
 static bool s8ts_down[S8TS_FINGERS];
@@ -115,7 +137,45 @@ fail:
 static bool
 s8ts_cmd_read(uint8_t cmd, uint8_t *r, unsigned rlen)
 {
-	return s8i2c_xfer(s8ts_i2c, S8TS_ADDR, &cmd, 1, r, rlen);
+	return s8i2c_xfer(s8ts_i2c, s8ts_addr, &cmd, 1, r, rlen);
+}
+
+/*
+ * One contact, raw axes 0..xmax-1 / 0..ymax-1, onto SweetHIDTouch's 1080x1920
+ * grid. down=false is a release (the last position is reused).
+ */
+static void
+s8ts_point(unsigned tid, bool down, unsigned x, unsigned y, unsigned xmax,
+    unsigned ymax)
+{
+	if (s8ts_native) {
+		x = x * 1080 / xmax;
+		y = y * 1920 / ymax;
+	} else {
+		/* 1125x2436 is shown centered on the 1440x2960 panel. */
+		int px = (int)(x * 1440 / xmax) - (1440 - 1125) / 2;
+		int py = (int)(y * 2960 / ymax) - (2960 - 2436) / 2;
+		px = px < 0 ? 0 : (px > 1124 ? 1124 : px);
+		py = py < 0 ? 0 : (py > 2435 ? 2435 : py);
+		x = (unsigned)px * 1080 / 1125;
+		y = (unsigned)py * 1920 / 2436;
+	}
+	if (down) {                                 /* press, move */
+		if (!s8ts_down[tid]) {
+			printf("S8 TOUCH: down id=%u x=%u y=%u\n", tid, x, y);
+		}
+		s8ts_down[tid] = true;
+		s8ts_x[tid] = (uint16_t)x;
+		s8ts_y[tid] = (uint16_t)y;
+		if (tid < 5) {
+			sweet_hid_touch((int)tid, 1, (int)x, (int)y);
+		}
+	} else if (s8ts_down[tid]) {                /* release */
+		s8ts_down[tid] = false;
+		if (tid < 5) {
+			sweet_hid_touch((int)tid, 0, s8ts_x[tid], s8ts_y[tid]);
+		}
+	}
 }
 
 static void
@@ -131,34 +191,46 @@ s8ts_report(const uint8_t *ev)
 	}
 	unsigned x = ((unsigned)ev[1] << 4) | (ev[3] >> 4);
 	unsigned y = ((unsigned)ev[2] << 4) | (ev[3] & 0xf);
-	if (s8ts_native) {
-		x = x * 1080 / 4096;
-		y = y * 1920 / 4096;
-	} else {
-		/* 1125x2436 is shown centered on the 1440x2960 panel. */
-		int px = (int)(x * 1440 / 4096) - (1440 - 1125) / 2;
-		int py = (int)(y * 2960 / 4096) - (2960 - 2436) / 2;
-		px = px < 0 ? 0 : (px > 1124 ? 1124 : px);
-		py = py < 0 ? 0 : (py > 2435 ? 2435 : py);
-		x = (unsigned)px * 1080 / 1125;
-		y = (unsigned)py * 1920 / 2436;
-	}
 	if (state == 1 || state == 2) {             /* press, move */
-		if (!s8ts_down[tid]) {
-			printf("S8 TOUCH: down id=%u x=%u y=%u\n", tid, x, y);
-		}
-		s8ts_down[tid] = true;
-		s8ts_x[tid] = (uint16_t)x;
-		s8ts_y[tid] = (uint16_t)y;
-		if (tid < 5) {
-			sweet_hid_touch((int)tid, 1, (int)x, (int)y);
-		}
-	} else if (state == 3 && s8ts_down[tid]) { /* release */
-		s8ts_down[tid] = false;
-		if (tid < 5) {
-			sweet_hid_touch((int)tid, 0, s8ts_x[tid], s8ts_y[tid]);
-		}
+		s8ts_point(tid, true, x, y, 4096, 4096);
+	} else if (state == 3) {                    /* release */
+		s8ts_point(tid, false, x, y, 4096, 4096);
 	}
+}
+
+/*
+ * STM FTS event (8 bytes). Event id = low nibble of ev[0]: 3 enter, 4 leave,
+ * 5 motion (mainline stmfts.c). Layout fmt 0 is stmfts.c's (slot = ev[0]>>4,
+ * x = ev[1] | (ev[2]&0xf)<<8, y = ev[2]>>4 | ev[3]<<4); fmt 1 is the Samsung
+ * fts_ts style (id = ev[1]&0xf, x = ev[2]<<4 | ev[4]>>4, y = ev[3]<<4 |
+ * ev[4]&0xf). Neither is confirmed for the FTS8CD56: check the raw log.
+ */
+static void
+s8fts_report(const uint8_t *ev)
+{
+	unsigned eid = ev[0] & 0x0fu, tid, x, y;
+	if (eid != 0x03 && eid != 0x04 && eid != 0x05) {
+		return;         /* ready/status/error/hover/key events */
+	}
+	if (s8ts_fmt == 0) {
+		tid = ev[0] >> 4;
+		x = (unsigned)ev[1] | ((unsigned)(ev[2] & 0x0fu) << 8);
+		y = (unsigned)(ev[2] >> 4) | ((unsigned)ev[3] << 4);
+	} else {
+		tid = ev[1] & 0x0fu;
+		x = ((unsigned)ev[2] << 4) | (ev[4] >> 4);
+		y = ((unsigned)ev[3] << 4) | (ev[4] & 0x0fu);
+	}
+	if (tid >= S8TS_FINGERS) {
+		return;
+	}
+	if (x >= S8FTS_XMAX) {
+		x = S8FTS_XMAX - 1;
+	}
+	if (y >= S8FTS_YMAX) {
+		y = S8FTS_YMAX - 1;
+	}
+	s8ts_point(tid, eid != 0x04, x, y, S8FTS_XMAX, S8FTS_YMAX);
 }
 
 static void
@@ -207,6 +279,129 @@ s8ts_thread(void *arg, wait_result_t result)
 		}
 		errors = 0;
 	}
+}
+
+/* Single-byte FTS command (stmfts.c: the command is the only byte sent). */
+static bool
+s8fts_cmd(uint8_t cmd)
+{
+	return s8i2c_xfer(s8ts_i2c, s8ts_addr, &cmd, 1, NULL, 0);
+}
+
+/*
+ * READ_ALL_EVENT (0x86): up to S8FTS_EV_PER_READ events of 8 bytes, an
+ * all-zero event ends the list (stmfts.c reads 256 bytes the same way).
+ * Returns the number of non-empty events, or -1 on an I2C error.
+ */
+static int
+s8fts_read(uint8_t *buf)
+{
+	uint8_t cmd = 0x86;
+	int n = 0;
+	if (!s8i2c_xfer(s8ts_i2c, s8ts_addr, &cmd, 1, buf, S8FTS_EV_PER_READ * S8FTS_EV_SIZE)) {
+		return -1;
+	}
+	for (unsigned i = 0; i < S8FTS_EV_PER_READ; i++) {
+		const uint8_t *ev = buf + i * S8FTS_EV_SIZE;
+		if (!ev[0] || ev[0] == 0xdb) {
+			break;
+		}
+		if (s8ts_raw_left) {
+			s8ts_raw_left--;
+			printf("S8 TOUCH: raw %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			    ev[0], ev[1], ev[2], ev[3], ev[4], ev[5], ev[6], ev[7]);
+		}
+		n++;
+	}
+	return n;
+}
+
+/* Wait up to ms for a controller-ready (0x10/0x11) or status (0x16) event. */
+static bool
+s8fts_wait_ready(unsigned ms)
+{
+	uint8_t buf[S8FTS_EV_PER_READ * S8FTS_EV_SIZE];
+	for (unsigned t = 0; t < ms; t += 10) {
+		s8ts_wait(10);
+		if (a5touch_read(s8ts_alive, S8TS_GPA1_DAT) & 1u) {
+			continue;       /* INT high: nothing queued */
+		}
+		if (s8fts_read(buf) > 0) {
+			for (unsigned i = 0; i < S8FTS_EV_PER_READ; i++) {
+				uint8_t id = buf[i * S8FTS_EV_SIZE];
+				if (id == 0x10 || id == 0x11 || id == 0x16) {
+					return true;
+				}
+			}
+		}
+	}
+	return false;
+}
+
+static void
+s8fts_thread(void *arg, wait_result_t result)
+{
+	uint8_t buf[S8FTS_EV_PER_READ * S8FTS_EV_SIZE];
+	unsigned errors = 0;
+	(void)arg;
+	(void)result;
+	printf("S8 TOUCH: FTS worker started\n");
+	for (;;) {
+		if (a5touch_read(s8ts_alive, S8TS_GPA1_DAT) & 1u) {
+			s8ts_wait(8);       /* INT is level low while events are queued */
+			continue;
+		}
+		int n = s8fts_read(buf);
+		if (n < 0) {
+			if (++errors <= 8 || !(errors & 255)) {
+				printf("S8 TOUCH: FTS event read failed (%u)\n", errors);
+			}
+			s8ts_wait(20);
+			continue;
+		}
+		if (n == 0) {
+			s8ts_wait(4);       /* INT low with an empty queue */
+			continue;
+		}
+		for (int i = 0; i < n; i++) {
+			s8fts_report(buf + (unsigned)i * S8FTS_EV_SIZE);
+		}
+		errors = 0;
+	}
+}
+
+/*
+ * Bring the FTS up (stmfts.c power-on order, minus the calibration commands:
+ * the stock firmware already holds its tuning): info, SYSTEM_RESET, wait for
+ * ready, SLEEP_OUT, MS_MT_SENSE_ON. The loader has already powered LDO34/35.
+ */
+static bool
+s8fts_start(void)
+{
+	uint8_t info[8] = {0};
+	if (!s8ts_cmd_read(0x80, info, 8)) {                    /* READ_INFO */
+		printf("S8 TOUCH: no FTS answer at 0x%02x\n", s8ts_addr);
+		return false;
+	}
+	printf("S8 TOUCH: FTS info %02x %02x %02x %02x %02x %02x %02x %02x\n",
+	    info[0], info[1], info[2], info[3], info[4], info[5], info[6], info[7]);
+	if (!s8fts_cmd(0xa0)) {                                 /* SYSTEM_RESET */
+		printf("S8 TOUCH: FTS reset command failed\n");
+		return false;
+	}
+	if (!s8fts_wait_ready(500)) {
+		printf("S8 TOUCH: FTS did not report ready after reset (continuing)\n");
+	}
+	if (!s8fts_cmd(0x91)) {                                 /* SLEEP_OUT */
+		printf("S8 TOUCH: FTS sleep-out failed\n");
+		return false;
+	}
+	(void)s8fts_wait_ready(500);
+	if (!s8fts_cmd(0x93)) {                                 /* MS_MT_SENSE_ON */
+		printf("S8 TOUCH: FTS sense-on failed\n");
+		return false;
+	}
+	return true;
 }
 
 static bool
@@ -280,6 +475,19 @@ dreamlte_touch_start(void)
 		return;
 	}
 	s8i2c_reset(s8ts_i2c);
+	(void)PE_parse_boot_argn("s8fts", &s8ts_fts, sizeof(s8ts_fts));
+	(void)PE_parse_boot_argn("s8fts_fmt", &s8ts_fmt, sizeof(s8ts_fmt));
+	if (s8ts_fts) {
+		s8ts_addr = S8TS_FTS_ADDR;
+		printf("S8 TOUCH: STM FTS mode (S8+), fmt %d\n", s8ts_fmt);
+		if (s8fts_start() &&
+		    kernel_thread_start(s8fts_thread, NULL, &thread) == KERN_SUCCESS) {
+			thread_deallocate(thread);
+		} else {
+			printf("S8 TOUCH: FTS not started\n");
+		}
+		return;
+	}
 	if (!s8ts_cmd_read(0x55, b, 1) || b[0] != 0x20) {     /* BOOT_STATUS */
 		printf("S8 TOUCH: no S6SY761 in application mode (status %#x)\n", b[0]);
 		return;
@@ -289,8 +497,8 @@ dreamlte_touch_start(void)
 	}
 	uint8_t func[3] = {0x30, 0x01, 0x00};                  /* TOUCH_FUNCTION = touch */
 	uint8_t sense = 0x10;                                   /* SENSE_ON */
-	if (!s8i2c_xfer(s8ts_i2c, S8TS_ADDR, func, 3, NULL, 0) ||
-	    !s8i2c_xfer(s8ts_i2c, S8TS_ADDR, &sense, 1, NULL, 0)) {
+	if (!s8i2c_xfer(s8ts_i2c, s8ts_addr, func, 3, NULL, 0) ||
+	    !s8i2c_xfer(s8ts_i2c, s8ts_addr, &sense, 1, NULL, 0)) {
 		printf("S8 TOUCH: enable sequence failed\n");
 		return;
 	}

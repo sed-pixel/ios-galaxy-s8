@@ -60,7 +60,13 @@
 #define RX_EMPTY		(1u << 24)
 #define TX_FULL			(1u << 7)
 
+#ifdef DREAM2LTE
+/* Galaxy S8+ (SM-G955F/FD): STM FTS8CD56 "fts_touch" at i2c-5 0x49. Same bus,
+ * rails (LDO34/35) and interrupt (gpa1-0) as the S8; UNTESTED on hardware. */
+#define TS_ADDR			0x49
+#else
 #define TS_ADDR			0x48
+#endif
 #define TIMER_HZ		26000000UL
 #define CLKIN			26000000u	/* USI09 user mux forced to OSCCLK */
 #define SCL_HZ			400000u
@@ -243,6 +249,22 @@ void touch_probe(void (*kv_fn)(const char *, uint64_t), void (*out_fn)(const cha
 	kv("fs3", hr(TIMING_FS3));
 	out("\n");
 
+#ifdef DREAM2LTE
+	/* Read-only FTS probe: none of the S6SY761 commands below are sent to an
+	 * FTS (an unknown command byte could be taken as a real one). READ_INFO
+	 * (0x80, 8 bytes: chip ver, fw ver, config, chip id) and READ_STATUS
+	 * (0x84, 4 bytes) only read. The kernel driver does the real start-up. */
+	out("FTS probe (S8+ 0x49, read-only)\n");
+	c = 0x80;
+	st = xfer(&c, 1, b, 8);
+	dump("fts info", b, 8, st);
+	c = 0x84;
+	st = xfer(&c, 1, b, 4);
+	dump("fts status", b, 4, st);
+	kv("gpa1 dat", rd(GPA1 + 4));
+	out("\nTOUCH probe done\n");
+	return;
+#endif
 	c = 0x55;	/* BOOT_STATUS: 0x20 = application */
 	st = xfer(&c, 1, b, 1);
 	dump("boot status", b, 1, st);

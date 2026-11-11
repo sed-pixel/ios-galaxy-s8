@@ -69,19 +69,31 @@ def cpu_node(logical):
     ]
 
 
-def build(canvas=(FB_W, FB_H)):
+# Galaxy S8+ (SM-G955F/FD, dream2lte) shares the Exynos 8895 board family. It is
+# NOT verified on hardware: every board constant above (framebuffer, RAM bank,
+# touch, UFS) is still the S8's until tools/dream2lte/compare_facts.py says the
+# phone matches. Only the platform identity differs, and the S8 names stay in
+# the compatible list so the kernel's IONameMatch tables keep matching.
+DEVICE_IDS = {
+    'dreamlte': ['samsung,dreamlte'],
+    'dream2lte': ['samsung,dream2lte', 'samsung,dreamlte'],
+}
+
+
+def build(canvas=(FB_W, FB_H), device='dreamlte'):
     root = mkadt.build(seed=os.urandom(64), qemu=True)
     # The kernel's SweetPlatformExpert personality matches 'samsung,a5xelte'
     # (KernelConfigTables.cpp); without it IOKit panics "Unable to find driver
     # for this platform" (S8 boot 3). IONameMatch accepts any listed name.
-    set_prop(root, 'compatible', mkadt.cstr('samsung,dreamlte') +
+    set_prop(root, 'compatible',
+             b''.join(mkadt.cstr(name) for name in DEVICE_IDS[device]) +
              mkadt.cstr('samsung,a5xelte') + mkadt.cstr('samsung,exynos8895') +
              mkadt.cstr('AppleARM'))
     chosen = child(root, 'chosen')
     set_prop(chosen, 'dram-base', mkadt.u64(DRAM_BASE))
     set_prop(chosen, 'dram-size', mkadt.u64(DRAM_SIZE))
-    set_prop(chosen, 'firmware-version', mkadt.cstr('dreamlte-entry'))
-    set_prop(chosen, 'system-firmware-version', mkadt.cstr('dreamlte-entry'))
+    set_prop(chosen, 'firmware-version', mkadt.cstr(f'{device}-entry'))
+    set_prop(chosen, 'system-firmware-version', mkadt.cstr(f'{device}-entry'))
     cpus = child(root, 'cpus')
     cpu0 = child(cpus, 'cpu0')
     for key, value in cpu_node(0):
@@ -136,7 +148,9 @@ if __name__ == '__main__':
     parser.add_argument('output', type=Path)
     parser.add_argument('--canvas', default=f'{FB_W}x{FB_H}',
                         help='display size presented to iOS, WxH')
+    parser.add_argument('--device', default='dreamlte', choices=sorted(DEVICE_IDS),
+                        help='dreamlte = S8 (SM-G950F), dream2lte = S8+ (SM-G955F/FD)')
     args = parser.parse_args()
-    blob = adt.serialize(build(tuple(int(v) for v in args.canvas.split('x'))))
+    blob = adt.serialize(build(tuple(int(v) for v in args.canvas.split('x')), args.device))
     args.output.write_bytes(blob)
     print(f'{args.output}: {len(blob)} bytes')
