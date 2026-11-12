@@ -1,0 +1,92 @@
+name: hfsplus-wsl
+
+# Builds ONLY the missing HFS+ driver (hfsplus.ko) for a Windows WSL2 kernel, on
+# GitHub's machines, so nothing heavy runs on the user's PC. The iOS root image
+# of this port is an HFS+ volume and WSL's stock kernel has no HFS+ support
+# (CONFIG_HFSPLUS_FS is not set).
+#
+# The module must match the running WSL kernel exactly (MODVERSIONS=y), so the
+# source is Microsoft's tag for that version and the build refuses to continue
+# if the kernel release or the config differ from what was asked for.
+#
+# Use: Actions > hfsplus-wsl > Run workflow. Put the output of `uname -r` from
+# WSL in the box. Download the artifact `hfsplus-wsl`, copy hfsplus.ko into
+# WSL and run: sudo insmod hfsplus.ko
+
+on:
+  workflow_dispatch:
+    inputs:
+      wsl_release:
+        description: "Output of 'uname -r' inside WSL"
+        default: "6.18.58.1-microsoft-standard-WSL2"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 180
+    steps:
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc \
+            dwarves git python3 rsync cpio zstd kmod
+
+      - name: Get Microsoft's source for exactly this WSL kernel
+        env:
+          REL: ${{ inputs.wsl_release }}
+        run: |
+          case "$REL" in
+            [0-9]*.[0-9]*.[0-9]*.[0-9]*-microsoft-standard-WSL2) ;;
+            *) echo "unexpected release string: $REL"; exit 1 ;;
+          esac
+          VER="${REL%%-*}"
+          git clone --depth 1 -b "linux-msft-wsl-$VER" https://github.com/microsoft/WSL2-Linux-Kernel kernel
+          git -C kernel log -1 --format='source commit %H'
+
+      - name: Config = Microsoft's WSL config + HFS+ as a module
+        working-directory: kernel
+        env:
+          REL: ${{ inputs.wsl_release }}
+        run: |
+          cp Microsoft/config-wsl .config
+          scripts/config --module HFSPLUS_FS
+          make olddefconfig
+          # Show every config line that differs from Microsoft's file.
+          diff <(grep -E '^(# )?CONFIG_' Microsoft/config-wsl | sort) \
+               <(grep -E '^(# )?CONFIG_' .config | sort) | tee ../config-diff.txt || true
+          # Only the HFS+ switch and compiler-capability probes may differ: anything
+          # else would change kernel structures and make the module incompatible.
+          BAD=$(grep -E '^[<>]' ../config-diff.txt | grep -vE 'HFSPLUS_FS|CONFIG_(CC_|GCC_|HAVE_GCC_PLUGINS|PLUGIN_HOSTCC|LD_|AS_|PAHOLE_|TOOLS_SUPPORT|RUSTC_|BINDGEN_|CLANG_)' || true)
+          if [ -n "$BAD" ]; then echo "UNEXPECTED CONFIG DIFFERENCES:"; echo "$BAD"; exit 1; fi
+          grep -E '^CONFIG_(HFSPLUS_FS|MODVERSIONS|NLS_UTF8|LEGACY_DIRECT_IO|BUFFER_HEAD)=' .config
+          test "$(make -s kernelrelease)" = "$REL" || { echo "kernel release is $(make -s kernelrelease), wanted $REL"; exit 1; }
+
+      - name: Build the kernel and modules (needed for matching symbol checksums)
+        working-directory: kernel
+        run: |
+          make -j"$(nproc)" modules
+          ls -l fs/hfsplus/hfsplus.ko
+
+      - name: Check the module against the requested kernel
+        working-directory: kernel
+        env:
+          REL: ${{ inputs.wsl_release }}
+        run: |
+          modinfo fs/hfsplus/hfsplus.ko | tee ../modinfo.txt
+          VM=$(modinfo -F vermagic fs/hfsplus/hfsplus.ko)
+          case "$VM" in "$REL "*) echo "vermagic OK: $VM" ;; *) echo "vermagic mismatch: $VM (wanted $REL)"; exit 1 ;; esac
+          mkdir -p ../out
+          cp fs/hfsplus/hfsplus.ko ../out/
+          (cd ../out && sha256sum hfsplus.ko | tee hfsplus.ko.sha256)
+          cp ../modinfo.txt ../config-diff.txt ../out/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: hfsplus-wsl
+          path: out/
+          retention-days: 30
