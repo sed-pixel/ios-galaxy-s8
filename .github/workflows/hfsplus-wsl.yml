@@ -53,6 +53,11 @@ jobs:
         env:
           REL: ${{ inputs.wsl_release }}
         run: |
+          # Microsoft's tag is a lightweight git tag, so the kernel build would
+          # append "+" to the release ("...-WSL2+") and the module's vermagic would
+          # no longer match the running kernel. LOCALVERSION set (even empty)
+          # suppresses it (scripts/setlocalversion).
+          export LOCALVERSION=
           cp Microsoft/config-wsl .config
           scripts/config --module HFSPLUS_FS
           make olddefconfig
@@ -74,6 +79,8 @@ jobs:
       - name: Build the kernel and modules (needed for matching symbol checksums)
         working-directory: kernel
         run: |
+          export LOCALVERSION=
+          make -s kernelrelease
           make -j"$(nproc)" modules
           ls -l fs/hfsplus/hfsplus.ko
 
