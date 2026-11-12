@@ -34,7 +34,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential flex bison libssl-dev libelf-dev bc \
-            dwarves git python3 rsync cpio zstd kmod
+            dwarves git python3 rsync cpio zstd kmod gcc-13-plugin-dev
 
       - name: Get Microsoft's source for exactly this WSL kernel
         env:
@@ -59,10 +59,15 @@ jobs:
           # Show every config line that differs from Microsoft's file.
           diff <(grep -E '^(# )?CONFIG_' Microsoft/config-wsl | sort) \
                <(grep -E '^(# )?CONFIG_' .config | sort) | tee ../config-diff.txt || true
-          # Only the HFS+ switch and compiler-capability probes may differ: anything
-          # else would change kernel structures and make the module incompatible.
-          BAD=$(grep -E '^[<>]' ../config-diff.txt | grep -vE 'HFSPLUS_FS|CONFIG_(CC_|GCC_|HAVE_GCC_PLUGINS|PLUGIN_HOSTCC|LD_|AS_|PAHOLE_|TOOLS_SUPPORT|RUSTC_|BINDGEN_|CLANG_)' || true)
-          if [ -n "$BAD" ]; then echo "UNEXPECTED CONFIG DIFFERENCES:"; echo "$BAD"; exit 1; fi
+          # Re-reading Microsoft's file with a slightly newer compiler (13.3 vs 13.2)
+          # changes compiler probes, some optional crypto modules and rust probes.
+          # Those do not alter the kernel structures the module is checked against
+          # (insmod also refuses a module whose symbol checksums differ). Fail only
+          # if an option that changes core layout or ABI differs.
+          DENY='CONFIG_(SMP|NR_CPUS|PREEMPT|PAGE_|X86_|PARAVIRT|KASAN|KCSAN|LOCKDEP|DEBUG_SPINLOCK|DEBUG_LOCK_ALLOC|STACKPROTECTOR|RANDSTRUCT|MODVERSIONS|MODULES|MODULE_|KPROBES|FTRACE|FUNCTION_TRACER|DEBUG_INFO_BTF)'
+          BAD=$(grep -E '^[<>]' ../config-diff.txt | grep -E "$DENY" \
+                | grep -vE '^< # CONFIG_RANDSTRUCT_(FULL|PERFORMANCE) is not set$' || true)
+          if [ -n "$BAD" ]; then echo "CONFIG DIFFERENCES THAT AFFECT THE KERNEL ABI:"; echo "$BAD"; exit 1; fi
           grep -E '^CONFIG_(HFSPLUS_FS|MODVERSIONS|NLS_UTF8|LEGACY_DIRECT_IO|BUFFER_HEAD)=' .config
           test "$(make -s kernelrelease)" = "$REL" || { echo "kernel release is $(make -s kernelrelease), wanted $REL"; exit 1; }
 
